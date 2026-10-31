@@ -1,129 +1,152 @@
-# Voice Intelligence Web Application
+﻿# Ubuntu LAN deployment — Iraqi Arabic Voice Intelligence
 
-This is a browser UI plus a drop-in FastAPI WebSocket router for your existing
-`voice_summrizer` project. It supports:
+This bundle adds LAN deployment files to the existing FastAPI project. It uses:
+- FastAPI/Uvicorn on `127.0.0.1:8000` (not directly exposed to the LAN)
+- Caddy as an HTTPS reverse proxy on TCP 443
+- Caddy's internal certificate authority
+- UFW rules allowing HTTPS only from the configured private subnet
+- systemd to keep the API running
 
-1. Audio file upload through your existing `POST /transcribe`.
-2. Live microphone capture.
-3. Browser-tab audio capture (Google Meet / browser Discord) using the browser's
-   screen/tab sharing dialog and the **Share tab audio** option.
-4. Rolling summary refreshes approximately once per minute, plus a final refresh
-   when the user stops.
+## Before deployment\n\nFor the exact integration with your public repository, follow `INTEGRATE_WITH_YOUR_SERVER.md` first. The live router has been corrected to use a NumPy waveform and your existing `whisper_lock`.\n
 
-## Important compatibility note
+You need the existing project folder containing `iraqi_listener.py`, its Python requirements, and the existing Whisper/Qwen model setup. This bundle does not replace your models or rewrite the existing `/transcribe` endpoint.
 
-The existing GitHub server file was not available to inspect from this build
-environment. The integration below is based on the project structure previously
-shared: `app`, `whisper_model`, and `summarize_transcript`. Check those exact
-names in `iraqi_listener.py` before adding the router.
+The web files in `web/` and `live_router.py` are the browser interface/live-audio add-on. The FastAPI integration is described in `README_INSTALL.md`. Confirm the integration uses the actual names in your server source before starting.
 
-## 1. Copy the files
+## 1. Copy the project to Ubuntu
 
-Copy the `web` directory into the same directory as `iraqi_listener.py`.
-Copy `live_router.py` beside `iraqi_listener.py`.
+Example:
 
-## 2. Install the additional dependency
-
-In the same Python environment as your API:
-
-```powershell
-pip install numpy
+```bash
+sudo mkdir -p /opt/voice_summrizer
+sudo rsync -a /path/to/your/voice_summrizer/ /opt/voice_summrizer/
 ```
 
-FastAPI, faster-whisper and Uvicorn are already required by your server.
+Copy this bundle's `live_router.py` and `web/` into `/opt/voice_summrizer/` if they are not already there.
 
-## 3. Add the router to iraqi_listener.py
+Create a service account and virtual environment:
 
-After `app` is created and after the existing `whisper_model` global and
-`summarize_transcript` function are defined, add:
-
-```python
-from fastapi.staticfiles import StaticFiles
-from live_router import build_live_router
-
-app.include_router(
-    build_live_router(
-        whisper_getter=lambda: whisper_model,
-        summarize_fn=summarize_transcript,
-    )
-)
-
-app.mount("/web", StaticFiles(directory="web"), name="web")
+```bash
+sudo useradd --system --create-home --home-dir /opt/voice_summrizer --shell /usr/sbin/nologin voiceapp
+sudo chown -R voiceapp:voiceapp /opt/voice_summrizer
+sudo -u voiceapp python3 -m venv /opt/voice_summrizer/.venv
+sudo -u voiceapp /opt/voice_summrizer/.venv/bin/pip install --upgrade pip
+sudo -u voiceapp /opt/voice_summrizer/.venv/bin/pip install -r /opt/voice_summrizer/requirements.txt
+sudo -u voiceapp /opt/voice_summrizer/.venv/bin/pip install numpy
 ```
 
-If your app already mounts `/web`, do not mount it twice. The router must be
-included after the existing model globals/functions are available.
+If your current server uses a different environment or requirements filename, install the exact same compatible dependencies into this venv. Do not blindly reinstall CUDA/PyTorch packages if your existing setup is already working.
 
-The router assumes `whisper_model.transcribe(...)` accepts a WAV file-like
-object. If your faster-whisper version requires a filesystem path, tell me the
-error and I can adapt it to your installed version.
+## 2. Integrate the web interface
 
-## 4. Serve the page at /
+Follow `README_INSTALL.md` to add the live router, static web directory, and `/` route to `iraqi_listener.py`. The service expects the import path `iraqi_listener:app`.
 
-Add this route to `iraqi_listener.py`:
+Important: the earlier prototype assumes `whisper_model` and `summarize_transcript` exist and that the Whisper call accepts the audio object passed by `live_router.py`. Verify these against your actual code. If your app has different names or uses a different audio input method, the router must be adapted before production use.
 
-```python
-from fastapi.responses import FileResponse
+## 3. Choose the LAN subnet
 
-@app.get("/", include_in_schema=False)
-def voice_intelligence_home():
-    return FileResponse("web/index.html")
+Find the server IP and subnet:
+
+```bash
+ip -br address
+ip route
 ```
 
-If you already have a `/` route, update that route instead.
+Example only: if your server is `192.168.1.50` and the LAN is `192.168.1.0/24`, use that CIDR. Do not assume this example matches your network.
 
-## 5. Run
+## 4. Install the LAN configuration
 
-From the project directory:
+From the extracted bundle:
 
-```powershell
-uvicorn iraqi_listener:app --host 0.0.0.0 --port 8000
+```bash
+sudo APP_SOURCE=/path/to/your/voice_summrizer LAN_CIDR=192.168.1.0/24 bash deploy/install_lan.sh
 ```
 
-Open on the server computer:
-`http://127.0.0.1:8000/`
+Replace both values. The script copies the app to `/opt/voice_summrizer`, installs Caddy if needed, installs the systemd unit and Caddyfile, and enables UFW rules. Review the script before running it. If UFW is already managed by your organization, add equivalent rules through your normal firewall instead.
 
-From another computer on your LAN:
-`http://SERVER-IP:8000/`
+Then create the virtual environment and install requirements as described above. Start:
 
-For microphone and tab capture, browsers require a secure context. `localhost`
-works over HTTP. For another computer, use HTTPS (for example, a local
-reverse proxy with a trusted certificate); plain HTTP LAN access may block
-`getUserMedia()` and `getDisplayMedia()`.
+```bash
+sudo systemctl start voice-summrizer
+sudo systemctl restart caddy
+sudo systemctl status voice-summrizer --no-pager
+sudo systemctl status caddy --no-pager
+```
 
-## 6. How live processing works
+Logs:
 
-The browser captures audio with Web Audio, converts it to 16-bit mono PCM, and
-sends five-second packets over `/ws/live`. The server buffers approximately
-15 seconds, then asks faster-whisper to transcribe the buffer. Every ~60 seconds
-of processed audio, it calls your existing `summarize_transcript()` on the
-session transcript. Stopping sends the remaining audio and requests a final
-summary.
+```bash
+sudo journalctl -u voice-summrizer -f
+sudo journalctl -u caddy -f
+```
 
-## 7. Meeting capture limitations
+## 5. Give the server a private hostname
 
-- The user must select the meeting tab and explicitly enable tab audio sharing.
-- The capture is audio only; it does not join meetings, bypass permissions, or
-  capture audio from tabs that the browser does not share.
-- Desktop Discord is not captured by browser tab sharing. Use Discord in a
-  browser or a separate desktop audio-capture helper.
-- Browser audio capture is subject to browser support and OS/browser policies.
-- Notify participants and obtain any required consent before recording.
+The chosen URL is:
 
-## 8. CPU and accuracy notes
+`https://voice.home.arpa`
 
-This is near-live, chunked transcription, not word-by-word streaming. A 15-second
-buffer reduces very short utterance fragmentation. On CPU, large-v3 may take
-longer than the audio duration, so transcript updates can lag. Qwen3-32B
-summarization every minute can be expensive; increase `summary_interval_seconds`
-to 120 or 180 in `live_router.py` if needed.
+Configure your router's local DNS to resolve `voice.home.arpa` to the Ubuntu server's LAN IP. If your router cannot provide local DNS, add a hosts-file entry on each client computer.
 
-The app is experimental. Review the transcript and summary against the original
-audio, especially names, numbers, medical information, and decisions.
+Windows hosts file (run Notepad as Administrator; edit `C:\Windows\System32\drivers\etc\hosts`):
 
-## 9. Security before exposing outside your LAN
+```text
+192.168.1.50    voice.home.arpa
+```
 
-Do not expose this development server directly to the public internet. Add
-authentication, TLS, upload limits, rate limiting, session isolation, and a
-retention/deletion policy first. This initial version is intended for a trusted
-local network.
+Replace the IP with the actual server IP. For managed environments, prefer internal DNS.
+
+## 6. Trust the internal HTTPS certificate
+
+Caddy generates a local root CA. On the Ubuntu server, locate its root certificate:
+
+```bash
+sudo find /var/lib/caddy -name root.crt -print
+```
+
+Usually it is:
+
+`/var/lib/caddy/.local/share/caddy/pki/authorities/local/root.crt`
+
+Copy this certificate securely to each authorized client and install it as a trusted **root CA** in that client's operating system trust store. Do not distribute `root.key` or any private key. Restart the browser after trusting the certificate.
+
+For Windows, open `mmc.exe` → Add/Remove Snap-in → Certificates → Computer account → Trusted Root Certification Authorities → Certificates → Import, then select `root.crt`. Only do this for a CA you control and whose fingerprint you have verified through a trusted channel.
+
+If Caddy runs under a different data directory, use the path reported by `find`. Do not copy the CA private key.
+
+## 7. Test
+
+From a LAN client:
+- Open `https://voice.home.arpa`
+- Confirm the browser shows a valid trusted HTTPS connection.
+- Test audio upload.
+- Test microphone permission.
+- Test tab sharing and select the meeting tab with **Share tab audio** enabled.
+
+The browser may deny microphone/tab capture if the certificate is not trusted, even though the page itself loads.
+
+## Network security
+
+- Uvicorn binds only to `127.0.0.1`; clients cannot bypass Caddy via port 8000.
+- Caddy rejects requests outside RFC1918 private IPv4 ranges.
+- UFW allows TCP 443 only from the configured LAN CIDR and denies TCP 8000.
+- Do not add router port-forwarding for 443 or 8000.
+- The Caddy IP filter is an additional layer, not user authentication. Anyone on the allowed LAN can access the app unless you add authentication.
+- For sensitive deployments, add login/authentication, per-user session isolation, retention/deletion controls, request limits, audit logs, and a consent process before use.
+- If your LAN uses IPv6, add an explicit IPv6 policy; the sample Caddy matcher is IPv4-private-only. Disable public IPv6 exposure or adapt the firewall and matcher.
+- Browser tab capture works only for browser tabs whose audio the user explicitly shares. It does not capture the desktop Discord app.
+
+## Troubleshooting
+
+```bash
+sudo ss -lntp | grep -E ':443|:8000'
+sudo ufw status verbose
+sudo journalctl -u voice-summrizer -n 100 --no-pager
+sudo journalctl -u caddy -n 100 --no-pager
+```
+
+Expected listeners:
+- Caddy on `:443`
+- Uvicorn on `127.0.0.1:8000`
+
+If Uvicorn fails, check the import path, virtualenv, environment variables, model paths/permissions, and startup logs. Loading large models can take time; systemd may show the service as starting while the models load.
